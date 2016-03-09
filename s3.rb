@@ -180,18 +180,46 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
     objects = list_new_files
 
     objects.each do |key|
-      @logger.debug("S3 input processing", :bucket => @bucket, :key => key)
-
-      lastmod = @s3bucket.objects[key].last_modified
-
-      process_log(queue, key)
-
-      sincedb.write(lastmod)
+      if stop?
+        break
+      else
+        @logger.debug("S3 input processing", :bucket => @bucket, :key => key)
+        process_log(queue, key)
+      end
     end
   end # def process_files
 
+  public
+  def stop
+    # @current_thread is initialized in the `#run` method,
+    # this variable is needed because the `#stop` is a called in another thread
+    # than the `#run` method and requiring us to call stop! with a explicit thread.
+    Stud.stop!(@current_thread)
+  end
+
+
+  public
+  def aws_service_endpoint(region)
+    region_to_use = get_region
+
+
+    return {
+      :s3_endpoint => region_to_use == 'us-east-1' ?
+        's3.amazonaws.com' : "s3-#{region_to_use}.amazonaws.com"
+    }
+  end
+
+
+
 
   private
+
+  # Read the content of the local file
+  #
+  # @param [Queue] Where to push the event
+  # @param [String] Which file to read from
+  # @return [Boolean] True if the file was completely read, false otherwise.
+
   def process_local_log(queue, filename)
     @logger.debug('Processing file', :filename => filename)
 
@@ -200,6 +228,11 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
     # So all IO stuff: decompression, reading need to be done in the actual
     # input and send as bytes to the codecs.
     read_file(filename) do |line|
+      if stop?
+        @logger.warn("Logstash S3 input, stop reading in the middle of the file, we will read it again when logstash is started")
+        return false
+      end
+
       @codec.decode(line) do |event|
         # We are making an assumption concerning cloudfront
         # log format, the user will use the plain or the line codec
@@ -286,9 +319,10 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
   def gzip?(filename)
     filename.end_with?('.gz')
   end
-  
+
+
   private
-  def sincedb 
+  def sincedb
     @sincedb ||= if @sincedb_path.nil?
                     @logger.info("Using default generated file for the sincedb", :filename => sincedb_file)
                     SinceDB::File.new(sincedb_file)
@@ -325,25 +359,37 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
     filename = File.join(temporary_directory, File.basename(key))
 
-    download_remote_file(object, filename)
+    if download_remote_file(object, filename)
 
-    process_local_log(queue, filename)
+      if process_local_log(queue, filename)
+        lastmod = object.last_modified
 
-    backup_to_bucket(object, key)
-    backup_to_dir(filename)
+        backup_to_bucket(object, key)
+        backup_to_dir(filename)
 
-    delete_file_from_bucket(object)
-    FileUtils.remove_entry_secure(filename, true)
+        delete_file_from_bucket(object)
+        FileUtils.remove_entry_secure(filename, true)
+        sincedb.write(lastmod)
+      end
+    else
+      FileUtils.remove_entry_secure(filename, true)
+    end
   end
 
   private
   def download_remote_file(remote_object, local_filename)
+    completed = false
+
     @logger.debug("S3 input: Download remote file", :remote_key => remote_object.key, :local_filename => local_filename)
     File.open(local_filename, 'wb') do |s3file|
       remote_object.read do |chunk|
+        return completed if stop?
         s3file.write(chunk)
       end
     end
+    completed = true
+
+    return completed
   end
 
   private
