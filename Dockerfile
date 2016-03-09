@@ -16,7 +16,7 @@ RUN ./bin/plugin install logstash-input-s3 && \
     ./bin/plugin install logstash-output-elasticsearch
 
 # Add files
-#ADD worker.rb ./vendor/bundle/jruby/1.9/gems/logstash-input-kinesis-1.4.3-java/lib/logstash/inputs/kinesis/
+ADD worker.rb ./vendor/bundle/jruby/1.9/gems/logstash-input-s3-2.0.4/lib/logstash/inputs/
 ADD ls-aws-sqs3.conf ./
 ADD aws-log-init.sh ./
 RUN chmod +x ./aws-log-init.sh
