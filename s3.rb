@@ -84,7 +84,17 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
     FileUtils.mkdir_p(@temporary_directory) unless Dir.exist?(@temporary_directory)
   end # def register
+  
+  public
+  def aws_service_endpoint(region)
+    region_to_use = @region
 
+    return {
+      :s3_endpoint => region_to_use == 'us-east-1' ?
+        's3.amazonaws.com' : "s3-#{region_to_use}.amazonaws.com"
+    }
+  end
+  
   public
   def run(queue)
     @current_thread = Thread.current
