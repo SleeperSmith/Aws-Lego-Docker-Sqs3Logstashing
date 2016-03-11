@@ -17,7 +17,7 @@ RUN ./bin/plugin install logstash-input-s3 && \
 	./bin/plugin install logstash-filter-fingerprint
 
 # Add files
-#ADD s3.rb ./vendor/bundle/jruby/1.9/gems/logstash-input-s3-2.0.4/lib/logstash/inputs/
+ADD s3.rb ./vendor/bundle/jruby/1.9/gems/logstash-input-s3-2.0.4/lib/logstash/inputs/
 ADD ls-aws-sqs3.conf ./
 ADD aws-log-init.sh ./
 RUN chmod +x ./aws-log-init.sh && \

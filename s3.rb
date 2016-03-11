@@ -1,5 +1,3 @@
-#/home/local/logstash-1.5.4/vendor/bundle/jruby/1.9/gems/logstash-output-elasticsearch-1.0.7-java/lib/logstash/
-
 # encoding: utf-8
 require "logstash/inputs/base"
 require "logstash/namespace"
@@ -15,45 +13,19 @@ require "stud/temporary"
 # Files ending in `.gz` are handled as gzip'ed files.
 class LogStash::Inputs::S3 < LogStash::Inputs::Base
   include LogStash::PluginMixins::AwsConfig
-  
-  #start sqs#
-  MAX_TIME_BEFORE_GIVING_UP = 60
-  MAX_MESSAGES_TO_FETCH = 10 # Between 1-10 in the AWS-SDK doc
-  SENT_TIMESTAMP = "SentTimestamp"
-  SQS_ATTRIBUTES = [SENT_TIMESTAMP]
-  BACKOFF_SLEEP_TIME = 1
-  BACKOFF_FACTOR = 2
-  DEFAULT_POLLING_FREQUENCY = 20
-  #end sqs#
-  
+
   config_name "s3"
 
-  default :codec, "plain"
-  
   #start sqs#
   # Name of the SQS Queue name to pull messages from. Note that this is just the name of the queue, not the URL or ARN.
-  config :queue, :validate => :string, :required => true
-  # Polling frequency, default is 20 seconds
-  config :polling_frequency, :validate => :number, :default => DEFAULT_POLLING_FREQUENCY
+  config :queue_name, :validate => :string, :required => true
+  # Polling frequency, default is 0 seconds
+  config :polling_frequency, :validate => :number, :default => 0
+  config :visibility_timeout, :validate => :number, :default => 3600
+  config :delete_queue_item, :validate => :boolean, :default => true
   #end sqs#
 
-  # DEPRECATED: The credentials of the AWS account used to access the bucket.
-  # Credentials can be specified:
-  # - As an ["id","secret"] array
-  # - As a path to a file containing AWS_ACCESS_KEY_ID=... and AWS_SECRET_ACCESS_KEY=...
-  # - In the environment, if not set (using variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
-  config :credentials, :validate => :array, :default => [], :deprecated => "This only exists to be backwards compatible. This plugin now uses the AwsConfig from PluginMixins"
-
-  # The name of the S3 bucket.
-  config :bucket, :validate => :string, :required => true
-
-  # The AWS region for your bucket.
-  config :region_endpoint, :validate => ["us-east-1", "us-west-1", "us-west-2",
-                                "eu-west-1", "ap-southeast-1", "ap-southeast-2",
-                                "ap-northeast-1", "sa-east-1", "us-gov-west-1"], :deprecated => "This only exists to be backwards compatible. This plugin now uses the AwsConfig from PluginMixins"
-
-  # If specified, the prefix of filenames in the bucket must match (not a regexp)
-  config :prefix, :validate => :string, :default => nil
+  default :codec, "plain"
 
   # Where to write the since database (keeps track of the date
   # the last handled file was added to S3). The default will write
@@ -91,18 +63,13 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
     require "fileutils"
     require "digest/md5"
     require "aws-sdk"
-	require 'json'
 
-    @region = get_region
+    @logger.info("Registering sqs3 input", :queue_name => @queue_name)
+    aws_sqs_client = Aws::SQS::Client.new(:region => @region)
+    queue_url = aws_sqs_client.get_queue_url(:queue_name =>  @queue_name)[:queue_url]
+    @poller = Aws::SQS::QueuePoller.new(queue_url, :client => aws_sqs_client)
 
-    @logger.info("Registering s3 input", :bucket => @bucket, :region => @region)
-
-    s3 = get_s3object
-	aws_sqs_client = Aws::SQS::Client.new(aws_options_hash)
-	queue_url = aws_sqs_client.get_queue_url(:queue_name =>  @queue)[:queue_url]
-	@poller = Aws::SQS::QueuePoller.new(queue_url, :client => aws_sqs_client)
-
-    @s3bucket = s3.buckets[@bucket]
+    s3 = AWS::S3.new(aws_options_hash)
 
     unless @backup_to_bucket.nil?
       @backup_bucket = s3.buckets[@backup_to_bucket]
@@ -120,41 +87,22 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
   public
   def run(queue)
-    @poller.poll(max_number_of_messages: 10, skip_delete: true, visibility_timeout: 0) do |messages|
+    @current_thread = Thread.current
+
+    @poller.poll(max_number_of_messages: 10, skip_delete: true, visibility_timeout: @visibility_timeout) do |messages|
       messages.each do |msg|
         body = JSON.parse(msg.body)
         inner_msg = JSON.parse(body["Message"])
-        record = inner_msg["Records"][0]["s3"]
-        objBucket = record["bucket"]["name"]
-        key = record["object"]["key"]
+        inner_msg["Records"].each do |record|
+          objBucket = record["s3"]["bucket"]["name"]
+          key = record["s3"]["object"]["key"]
 
-        if (key.start_with?(@prefix) && objBucket == @bucket)
-          lastmod = @s3bucket.objects[key].last_modified
-          process_log(queue, key)
+          process_log(queue, key, objBucket)
         end
+		@poller.delete_message(msg)
       end
     end
-    #Stud.interval(@interval) do
-    #  process_files(queue)
-    #end
   end # def run
-
-  public
-  def list_new_files
-    objects = {}
-
-    @s3bucket.objects.with_prefix(@prefix).each do |log|
-      @logger.debug("S3 input: Found key", :key => log.key)
-
-      unless ignore_filename?(log.key)
-        if sincedb.newer?(log.last_modified)
-          objects[log.key] = log.last_modified
-          @logger.debug("S3 input: Adding to objects[]", :key => log.key)
-        end
-      end
-    end
-    return objects.keys.sort {|a,b| objects[a] <=> objects[b]}
-  end # def fetch_new_files
 
   public
   def backup_to_bucket(object, key)
@@ -176,20 +124,6 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
   end
 
   public
-  def process_files(queue)
-    objects = list_new_files
-
-    objects.each do |key|
-      if stop?
-        break
-      else
-        @logger.debug("S3 input processing", :bucket => @bucket, :key => key)
-        process_log(queue, key)
-      end
-    end
-  end # def process_files
-
-  public
   def stop
     # @current_thread is initialized in the `#run` method,
     # this variable is needed because the `#stop` is a called in another thread
@@ -197,30 +131,13 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
     Stud.stop!(@current_thread)
   end
 
-
-  public
-  def aws_service_endpoint(region)
-    region_to_use = get_region
-
-
-    return {
-      :s3_endpoint => region_to_use == 'us-east-1' ?
-        's3.amazonaws.com' : "s3-#{region_to_use}.amazonaws.com"
-    }
-  end
-
-
-
-
   private
-
   # Read the content of the local file
   #
   # @param [Queue] Where to push the event
   # @param [String] Which file to read from
   # @return [Boolean] True if the file was completely read, false otherwise.
-
-  def process_local_log(queue, filename)
+  def process_local_log(queue, filename, objBucket, key)
     @logger.debug('Processing file', :filename => filename)
 
     metadata = {}
@@ -234,6 +151,8 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
       end
 
       @codec.decode(line) do |event|
+        event["s3_key"] = key
+        event["s3_bucket"] = objBucket
         # We are making an assumption concerning cloudfront
         # log format, the user will use the plain or the line codec
         # and the message key will represent the actual line content.
@@ -256,6 +175,8 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
         end
       end
     end
+
+    return true
   end # def process_local_log
 
   private
@@ -275,7 +196,7 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
     line.start_with?('#Fields: ')
   end
 
-  private 
+  private
   def update_metadata(metadata, event)
     line = event['message'].strip
 
@@ -290,7 +211,7 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
   private
   def read_file(filename, &block)
-    if gzip?(filename) 
+    if gzip?(filename)
       read_gzip_file(filename, block)
     else
       read_plain_file(filename, block)
@@ -320,7 +241,6 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
     filename.end_with?('.gz')
   end
 
-
   private
   def sincedb
     @sincedb ||= if @sincedb_path.nil?
@@ -335,38 +255,22 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
   private
   def sincedb_file
-    File.join(ENV["HOME"], ".sincedb_" + Digest::MD5.hexdigest("#{@bucket}+#{@prefix}"))
+    File.join(ENV["HOME"], ".sincedb_sqs3_deprecated")
   end
 
   private
-  def ignore_filename?(filename)
-    if @prefix == filename
-      return true
-    elsif (@backup_add_prefix && @backup_to_bucket == @bucket && filename =~ /^#{backup_add_prefix}/)
-      return true
-    elsif @exclude_pattern.nil?
-      return false
-    elsif filename =~ Regexp.new(@exclude_pattern)
-      return true
-    else
-      return false
-    end
-  end
-
-  private
-  def process_log(queue, key)
-    object = @s3bucket.objects[key]
-
+  def process_log(queue, key, objBucket)
+  
+    s3 = AWS::S3.new(aws_options_hash)
+    object = s3.buckets[objBucket].objects[key]
+	
     filename = File.join(temporary_directory, File.basename(key))
 
     if download_remote_file(object, filename)
-
-      if process_local_log(queue, filename)
+      if process_local_log(queue, filename, objBucket, key)
         lastmod = object.last_modified
-
         backup_to_bucket(object, key)
         backup_to_dir(filename)
-
         delete_file_from_bucket(object)
         FileUtils.remove_entry_secure(filename, true)
         sincedb.write(lastmod)
@@ -377,6 +281,11 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
   end
 
   private
+  # Stream the remove file to the local disk
+  #
+  # @param [S3Object] Reference to the remove S3 objec to download
+  # @param [String] The Temporary filename to stream to.
+  # @return [Boolean] True if the file was completely downloaded
   def download_remote_file(remote_object, local_filename)
     completed = false
 
@@ -400,55 +309,6 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
   end
 
   private
-  def get_region
-    # TODO: (ph) Deprecated, it will be removed
-    if @region_endpoint
-      @region_endpoint
-    else
-      @region
-    end
-  end
-
-  private
-  def get_s3object
-    # TODO: (ph) Deprecated, it will be removed
-    if @credentials.length == 1
-      File.open(@credentials[0]) { |f| f.each do |line|
-        unless (/^\#/.match(line))
-          if(/\s*=\s*/.match(line))
-            param, value = line.split('=', 2)
-            param = param.chomp().strip()
-            value = value.chomp().strip()
-            if param.eql?('AWS_ACCESS_KEY_ID')
-              @access_key_id = value
-            elsif param.eql?('AWS_SECRET_ACCESS_KEY')
-              @secret_access_key = value
-            end
-          end
-        end
-      end
-      }
-    elsif @credentials.length == 2
-      @access_key_id = @credentials[0]
-      @secret_access_key = @credentials[1]
-    end
-
-    if @credentials
-      s3 = AWS::S3.new(
-        :access_key_id => @access_key_id,
-        :secret_access_key => @secret_access_key,
-        :region => @region
-      )
-    else
-      s3 = AWS::S3.new(aws_options_hash)
-    end
-  end
-
-  private
-  def aws_service_endpoint(region)
-    return { :s3_endpoint => region }
-  end
-
   module SinceDB
     class File
       def initialize(file)
@@ -461,11 +321,12 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
       def read
         if ::File.exists?(@sincedb_path)
-          since = Time.parse(::File.read(@sincedb_path).chomp.strip)
+          content = ::File.read(@sincedb_path).chomp.strip
+          # If the file was created but we didn't have the time to write to it
+          return content.empty? ? Time.new(0) : Time.parse(content)
         else
-          since = Time.new(0)
+          return Time.new(0)
         end
-        return since
       end
 
       def write(since = nil)
