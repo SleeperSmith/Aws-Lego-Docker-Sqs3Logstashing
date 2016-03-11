@@ -99,7 +99,9 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
 
           process_log(queue, key, objBucket)
         end
-		@poller.delete_message(msg)
+		if @delete_queue_item
+		  @poller.delete_message(msg)
+		end
       end
     end
   end # def run
