@@ -25,4 +25,4 @@ RUN chmod +x ./aws-log-init.sh && \
 	chmod 666 /home/local/temp
 
 # Create user and assign permission
-#ENTRYPOINT ["/home/local/aws-log-init.sh"]
+ENTRYPOINT ["/home/local/aws-log-init.sh"]
